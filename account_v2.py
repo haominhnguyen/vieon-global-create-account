@@ -992,6 +992,120 @@ def create_vieon_account(email_data, proxy, proxy_port, sec):
                 time.sleep(1)
             if not otp_form_found:
                 log_message("⚠️ OTP input/form did not appear within timeout — proceeding to poll email anyway.", "WARNING")
+        else:
+            # No CAPTCHA detected — ensure we submitted the email by clicking the start/register button
+            log_message("ℹ️ Không có CAPTCHA — sẽ cố gắng nhấn nút 'Bắt đầu' / 'Đăng ký' để gửi email...", "INFO")
+            # More robust submit attempt when no captcha present — try CSS selectors, then XPath by visible text
+            css_candidates = [
+                ".Style_button__T_Eqf.Style_primary__7QMp",
+                ".Style_button__T_Eqf.Style_primary__7QMpR",
+                "button[type='submit']",
+                "button[class*='Style_button']",
+                "button[class*='primary']",
+            ]
+            xpath_texts = [
+                "Bắt đầu",
+                "Bat dau",
+                "Bắt dau",
+                "Đăng ký",
+                "Dang ky",
+                "Bắt đầu đăng ký",
+            ]
+
+            def try_click_element(el):
+                try:
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+                except:
+                    pass
+                time.sleep(0.2)
+
+                # Try normal click
+                try:
+                    el.click()
+                    return True
+                except:
+                    pass
+
+                # Try JS click
+                try:
+                    driver.execute_script("arguments[0].click();", el)
+                    return True
+                except:
+                    pass
+
+                # Try dispatching mouse events (for tricky button handlers)
+                try:
+                    driver.execute_script("var el=arguments[0]; el.dispatchEvent(new MouseEvent('mouseover',{bubbles:true})); el.dispatchEvent(new MouseEvent('mousedown',{bubbles:true})); el.dispatchEvent(new MouseEvent('mouseup',{bubbles:true})); el.click();", el)
+                    return True
+                except:
+                    pass
+
+                # Try elementFromPoint click fallback (click at center)
+                try:
+                    box = el.rect
+                    x = box['x'] + box['width']/2
+                    y = box['y'] + box['height']/2
+                    driver.execute_script(
+                        "var ev = new MouseEvent('click', {bubbles:true, clientX: arguments[1], clientY: arguments[2]}); document.elementFromPoint(arguments[1], arguments[2]).dispatchEvent(ev);",
+                        el, int(x), int(y)
+                    )
+                    return True
+                except:
+                    pass
+
+                return False
+
+            clicked_ok = False
+            # Try CSS candidates first
+            for sel in css_candidates:
+                try:
+                    elems = driver.find_elements(By.CSS_SELECTOR, sel)
+                    for el in elems:
+                        if not el.is_displayed():
+                            continue
+                        if try_click_element(el):
+                            log_message(f"✓ Clicked submit button (css: {sel})", "SUCCESS")
+                            clicked_ok = True
+                            break
+                    if clicked_ok:
+                        break
+                except Exception:
+                    continue
+
+            # If not found, try XPath searches by visible text
+            if not clicked_ok:
+                for txt in xpath_texts:
+                    try:
+                        xpath = f"//button[contains(normalize-space(string(.)), '{txt}')]"
+                        elems = driver.find_elements(By.XPATH, xpath)
+                        for el in elems:
+                            if not el.is_displayed():
+                                continue
+                            if try_click_element(el):
+                                log_message(f"✓ Clicked submit button (xpath text: {txt})", "SUCCESS")
+                                clicked_ok = True
+                                break
+                        if clicked_ok:
+                            break
+                    except Exception:
+                        continue
+
+            if not clicked_ok:
+                # As a last resort, try to remove potential overlays and retry a simple body send_keys(ENTER)
+                try:
+                    driver.execute_script("document.querySelectorAll('*').forEach(e=>{ if(getComputedStyle(e).position==='fixed' && (e.offsetHeight>0 && e.offsetWidth>0)){ e.style.pointerEvents='none'; } });")
+                    time.sleep(0.3)
+                    try:
+                        driver.find_element(By.TAG_NAME, 'body').send_keys(Keys.ENTER)
+                        log_message("✓ Sent ENTER key to body as fallback", "SUCCESS")
+                        clicked_ok = True
+                    except:
+                        pass
+                except:
+                    pass
+
+            if not clicked_ok:
+                log_message("⚠️ Không tìm thấy hoặc click nút submit thành công. Tiếp tục polling OTP...", "WARNING")
         
         # Cho OTP
         log_message(f"Cho OTP tu Vieon...", "INFO")
