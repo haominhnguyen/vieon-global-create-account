@@ -26,6 +26,12 @@ except Exception:
     winsound = None
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Import OTP form
+try:
+    from otp_form import show_otp_verbose_form
+except ImportError:
+    show_otp_verbose_form = None
+
 # Set up UTF-8 output stream
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
@@ -46,6 +52,7 @@ max_concurrent = 1
 proxy_list = []  # Danh sách proxy (để xoay vòng)
 proxy_index = 0  # Index hiện tại khi xoay vòng proxy
 seen_otp_ids = set()  # Global set to track OTP message IDs across all account creations
+created_emails_global = []  # Track all created emails for display in form
 
 # Queue for async logging (non-blocking)
 import queue
@@ -60,7 +67,7 @@ progress_var = None
 progress_bar = None
 
 # Theme
-current_theme = "dark"  # dark or light
+current_theme = "light"  # dark or light
 THEMES = {
     "dark": {
         "bg": "#0a0e27",
@@ -74,15 +81,15 @@ THEMES = {
         "info": "#00ff00",
     },
     "light": {
-        "bg": "#f5f5f5",
-        "fg": "#1a1a1a",
-        "primary": "#ffffff",
-        "secondary": "#e0e0e0",
-        "accent": "#00aa44",
-        "success": "#00aa44",
-        "error": "#dd0000",
-        "warning": "#ff8800",
-        "info": "#0088ff",
+        "bg": "#ffffff",
+        "fg": "#2c3e50",
+        "primary": "#ecf0f1",
+        "secondary": "#d5dbdb",
+        "accent": "#27ae60",
+        "success": "#27ae60",
+        "error": "#e74c3c",
+        "warning": "#f39c12",
+        "info": "#3498db",
     }
 }
 
@@ -224,28 +231,54 @@ def get_message_content(token, message_id):
         return ""
 
 def extract_otp(text):
-    """Trích OTP từ email"""
+    """Trích OTP từ email - ưu tiên OTP trong nội dung email, tránh ngày"""
     if not text:
         return None
-    # search for 4-6 consecutive digits
-    otp = re.search(r"\b\d{4,6}\b", text)
-    if otp:
-        return otp.group()
-    # fallback: search anywhere for digits (handles HTML with tags between digits)
+    
+    # Loại bỏ các số trong URL, timestamp, ngày tháng năm
+    # Tìm kiếm các pattern thường dùng cho OTP
+    otp_patterns = [
+        r"security code:?\s*(\d{4,6})",  # "security code: 1234"
+        r"code:?\s*(\d{4,6})",  # "code: 1234"
+        r"OTP:?\s*(\d{4,6})",  # "OTP: 1234"
+        r"verification code:?\s*(\d{4,6})",  # "verification code: 1234"
+        r"verify.*?(\d{4,6})",  # "verify ... 1234"
+        r"(\d{4,6})\s*(?:is|as|your)?\s*(?:code|otp|verification)",  # "1234 is code"
+    ]
+    
+    # Tìm OTP dựa trên pattern
+    for pattern in otp_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            otp = match.group(1) if match.groups() else match.group()
+            # Loại bỏ năm (4 chữ số đầu của năm như 2025, 2024, v.v.)
+            if otp.startswith(('20', '19', '25')):  # Năm từ 1900-2099
+                continue
+            return otp
+    
+    # Fallback: Tìm số 4-6 chữ số nhưng không phải năm
+    for match in re.finditer(r"\b(\d{4,6})\b", text):
+        otp = match.group(1)
+        # Loại bỏ các năm thường gặp
+        if otp not in ['2024', '2025', '2026', '2027', '1970', '0000']:
+            return otp
+    
+    # Cuối cùng: compact all digits
     compact = re.sub(r"\D+", "", text)
     if 4 <= len(compact) <= 6:
         return compact
+    
     return None
 
 def wait_for_otp(token, timeout=120):
     """Chờ và lấy OTP từ email - chỉ kiểm tra email mới (tạo sau khi hàm này được gọi)"""
     global seen_otp_ids
-    log_message(f"Cho OTP (toi da {timeout}s)...", "INFO")
+    log_message(f"⏳ Đợi OTP (tối đa {timeout}s)...", "INFO")
     start_time = datetime.now()
 
     for attempt in range(timeout):
         if stop_flag:
-            log_message("Bi dung khi cho OTP", "WARNING")
+            log_message("⚠️  Bị dừng khi đợi OTP", "WARNING")
             return None
 
         try:
@@ -284,7 +317,7 @@ def wait_for_otp(token, timeout=120):
 
         time.sleep(1)
 
-    log_message("Timeout cho OTP", "ERROR")
+    log_message("❌ Timeout đợi OTP", "ERROR")
     return None
 
 def create_email_with_token():
@@ -361,69 +394,583 @@ def save_otp_to_csv(email, password_email, otp, filename="otp_accounts.csv"):
         log_message(f"Lỗi lưu OTP: {e}", "ERROR")
 
 
-def verbose_check_email(email, password):
-    """Fetch full raw messages for an email account and log headers/body and extracted OTPs."""
+def verbose_check_email(email, password, mail_widget=None, status_widget=None):
+    """Interactive email viewer - login and browse all emails.
+    If mail_widget and status_widget provided, display in existing form instead of creating new window.
+    """
     try:
         log_message(f"Verbose check cho {email}", "INFO")
-        # get token
+        
+        # Get token
         r = SESSION.post(f"{API_MAIL}/token", json={"address": email, "password": password})
         r.raise_for_status()
         token = r.json().get("token")
+        
         if not token:
-            log_message("Không lấy được token", "ERROR")
+            log_message("❌ Không lấy được token - sai password?", "ERROR")
+            if status_widget:
+                status_widget.set("❌ Login failed - check password")
+            else:
+                messagebox.showerror("Error", f"Could not login to {email}\n\nCheck your password!")
             return
-        log_message(f"Token: {token}", "INFO")
-
+        
+        log_message(f"✓ Token: {token[:20]}...", "SUCCESS")
+        
+        if status_widget:
+            status_widget.set("✓ Token received - fetching emails...")
+        
+        # Fetch all messages
         msgs = list_messages(token)
         if not msgs:
-            log_message("Inbox trống", "WARNING")
+            log_message("⚠️ Inbox trống", "WARNING")
+            if status_widget and mail_widget:
+                # Show professional empty state in mail widget
+                mail_widget.config(state=tk.NORMAL)
+                mail_widget.delete(1.0, tk.END)
+                
+                # Configure tags for empty state
+                try:
+                    mail_widget.tag_config("EMPTY_TITLE", foreground=THEMES[current_theme]["warning"], font=("Segoe UI", 12, "bold"))
+                    mail_widget.tag_config("EMPTY_INFO", foreground=THEMES[current_theme]["info"], font=("Segoe UI", 10))
+                except:
+                    pass
+                
+                # Add empty inbox message
+                mail_widget.insert(tk.END, "\n" * 8)
+                mail_widget.insert(tk.END, "                      📭 INBOX IS EMPTY\n\n", "EMPTY_TITLE")
+                mail_widget.insert(tk.END, f"No emails received for {email}\n\n", "EMPTY_INFO")
+                mail_widget.insert(tk.END, "Please check back later or try another email account.", "EMPTY_INFO")
+                
+                mail_widget.config(state=tk.DISABLED)
+                status_widget.set("⚠️ Inbox is empty")
+            elif status_widget:
+                status_widget.set("⚠️ Inbox is empty")
+            else:
+                messagebox.showinfo("Info", f"Inbox is empty for {email}")
             return
-
-        import json
-        for msg in msgs:
-            mid = msg.get("id")
-            if not mid:
-                continue
+        
+        log_message(f"📧 Tìm được {len(msgs)} email", "INFO")
+        
+        if status_widget:
+            status_widget.set(f"✓ Loaded {len(msgs)} emails")
+        
+        # If mail_widget provided, display directly in that widget
+        if mail_widget and status_widget:
+            mail_widget.config(state=tk.NORMAL)
+            mail_widget.delete(1.0, tk.END)  # Clear all old content
+            
+            # Configure text tags if not already done
             try:
-                r2 = SESSION.get(f"{API_MAIL}/messages/{mid}", headers={"Authorization": f"Bearer {token}"})
-                r2.raise_for_status()
-                data = r2.json()
+                mail_widget.tag_config("HEADER", foreground=THEMES[current_theme]["accent"], font=("Courier New", 11, "bold"))
+                mail_widget.tag_config("KEY", foreground=THEMES[current_theme]["warning"], font=("Courier New", 9, "bold"))
+                mail_widget.tag_config("OTP", foreground=THEMES[current_theme]["error"], background=THEMES[current_theme]["secondary"], font=("Courier New", 11, "bold"))
+                mail_widget.tag_config("INFO", foreground=THEMES[current_theme]["info"])
+                mail_widget.tag_config("SUBJECT", foreground=THEMES[current_theme]["fg"], font=("Segoe UI", 10, "bold"))
+            except:
+                pass
+            
+            # Display all emails
+            import json
+            
+            mail_widget.insert(tk.END, f"📧 INBOX FOR {email}\n", "HEADER")
+            mail_widget.insert(tk.END, f"Total: {len(msgs)} emails\n", "INFO")
+            mail_widget.insert(tk.END, f"\n{'='*70}\n\n", "INFO")
+            
+            for idx, msg in enumerate(msgs, 1):
+                mid = msg.get("id")
+                subject = msg.get("subject") or msg.get("from") or "(no subject)"
+                
+                if not mid:
+                    continue
+                
+                # Fetch full email content
+                try:
+                    r = SESSION.get(f"{API_MAIL}/messages/{mid}", 
+                                  headers={"Authorization": f"Bearer {token}"})
+                    r.raise_for_status()
+                    data = r.json()
+                    pretty = json.dumps(data, ensure_ascii=False, indent=2)
+                    
+                    # Show email header
+                    mail_widget.insert(tk.END, f"[EMAIL #{idx}] {subject}\n", "SUBJECT")
+                    mail_widget.insert(tk.END, f"ID: {mid}\n", "KEY")
+                    
+                    # Check for OTP
+                    otp = extract_otp(pretty)
+                    if otp:
+                        mail_widget.insert(tk.END, f"🔐 OTP FOUND: {otp}\n", "OTP")
+                    
+                    mail_widget.insert(tk.END, f"\n{'-'*70}\n", "INFO")
+                    mail_widget.insert(tk.END, pretty + "\n\n")
+                    mail_widget.insert(tk.END, f"\n{'='*70}\n\n", "INFO")
+                    
+                except Exception as e:
+                    mail_widget.insert(tk.END, f"❌ Error fetching email #{idx}: {str(e)[:50]}\n", "INFO")
+                    continue
+            
+            mail_widget.config(state=tk.DISABLED)
+            mail_widget.see(1.0)  # Scroll to beginning
+            status_widget.set(f"✓ Loaded {len(msgs)} emails successfully")
+            log_message(f"✓ Displayed {len(msgs)} emails in form", "SUCCESS")
+            return
+        
+        # ==================== IF NO WIDGET PROVIDED, CREATE NEW WINDOW ====================
+        # Create interactive viewer window
+        viewer_window = tk.Toplevel()
+        viewer_window.title(f"📧 Email Viewer - {email}")
+        viewer_window.geometry("1000x700")
+        viewer_window.configure(bg=THEMES[current_theme]["bg"])
+        try:
+            viewer_window.transient()
+            viewer_window.grab_set()
+        except:
+            pass
+        
+        # ==================== MAIN CONTAINER ====================
+        main_container = tk.Frame(viewer_window, bg=THEMES[current_theme]["bg"])
+        main_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+        
+        # ==================== HEADER ====================
+        header_frame = tk.Frame(main_container, bg=THEMES[current_theme]["primary"], relief=tk.RAISED, bd=1)
+        header_frame.pack(fill=tk.X, pady=(0, 15))
+        
+        title = tk.Label(header_frame, text=f"📧 EMAIL VIEWER - {email}", font=("Segoe UI", 14, "bold"), 
+                        bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"], padx=20, pady=10)
+        title.pack(anchor=tk.W)
+        
+        info_label = tk.Label(header_frame, text=f"Total: {len(msgs)} emails", 
+                             font=("Segoe UI", 10), bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["info"], padx=20, pady=5)
+        info_label.pack(anchor=tk.W)
+        
+        # ==================== CONTENT - TWO COLUMNS ====================
+        content_frame = tk.Frame(main_container, bg=THEMES[current_theme]["bg"])
+        content_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # LEFT COLUMN - Email List
+        left_frame = tk.Frame(content_frame, bg=THEMES[current_theme]["bg"], width=300)
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 10))
+        left_frame.pack_propagate(False)
+        
+        list_label = tk.Label(left_frame, text="📬 Inbox", font=("Segoe UI", 11, "bold"),
+                             bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"])
+        list_label.pack(anchor=tk.W, pady=5)
+        
+        # Scrollable email list
+        list_frame = tk.Frame(left_frame, bg=THEMES[current_theme]["primary"], relief=tk.SUNKEN, bd=2)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        list_canvas = tk.Canvas(list_frame, bg=THEMES[current_theme]["bg"], highlightthickness=0, width=280)
+        list_scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=list_canvas.yview)
+        list_scrollable_frame = tk.Frame(list_canvas, bg=THEMES[current_theme]["bg"])
+        
+        list_scrollable_frame.bind(
+            "<Configure>",
+            lambda e: list_canvas.configure(scrollregion=list_canvas.bbox("all"))
+        )
+        
+        list_canvas.create_window((0, 0), window=list_scrollable_frame, anchor="nw")
+        list_canvas.configure(yscrollcommand=list_scrollbar.set)
+        
+        # RIGHT COLUMN - Email Content
+        right_frame = tk.Frame(content_frame, bg=THEMES[current_theme]["bg"])
+        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        
+        content_label = tk.Label(right_frame, text="📖 Content", font=("Segoe UI", 11, "bold"),
+                                bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"])
+        content_label.pack(anchor=tk.W, pady=5)
+        
+        # Content text area
+        content_text = scrolledtext.ScrolledText(right_frame, font=("Courier New", 9), 
+                                                bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["fg"],
+                                                relief=tk.SUNKEN, bd=1, wrap=tk.WORD)
+        content_text.pack(fill=tk.BOTH, expand=True)
+        content_text.config(state=tk.DISABLED)
+        
+        # Configure text tags
+        content_text.tag_config("HEADER", foreground=THEMES[current_theme]["accent"], font=("Courier New", 9, "bold"))
+        content_text.tag_config("KEY", foreground=THEMES[current_theme]["warning"], font=("Courier New", 9, "bold"))
+        content_text.tag_config("OTP", foreground=THEMES[current_theme]["error"], background=THEMES[current_theme]["secondary"], font=("Courier New", 10, "bold"))
+        content_text.tag_config("INFO", foreground=THEMES[current_theme]["info"])
+        
+        # Store email data
+        selected_email_var = tk.StringVar()
+        
+        def show_email_content(email_id, subject):
+            """Display email content when clicked."""
+            try:
+                # Update header
+                content_text.config(state=tk.NORMAL)
+                content_text.delete(1.0, tk.END)
+                
+                # Fetch full email
+                r = SESSION.get(f"{API_MAIL}/messages/{email_id}", 
+                              headers={"Authorization": f"Bearer {token}"})
+                r.raise_for_status()
+                data = r.json()
+                
+                import json
                 pretty = json.dumps(data, ensure_ascii=False, indent=2)
-                # Truncate to avoid extremely long logs
-                preview = pretty[:4000]
-                log_message(f"RAW message id={mid}:\n{preview}", "INFO")
-
-                # Try extract OTP from combined JSON text
+                
+                # Display formatted content
+                content_text.insert(tk.END, f"📧 EMAIL: {subject}\n", "HEADER")
+                content_text.insert(tk.END, f"ID: {email_id}\n", "INFO")
+                content_text.insert(tk.END, f"\n{'='*60}\n\n", "INFO")
+                
+                # Check for OTP
                 otp = extract_otp(pretty)
                 if otp:
-                    log_message(f"Tìm thấy OTP: {otp}", "SUCCESS")
-                    try:
-                        save_otp_to_csv(email, password, otp)
-                    except:
-                        pass
+                    content_text.insert(tk.END, f"🔐 OTP FOUND: {otp}\n", "OTP")
+                    content_text.insert(tk.END, f"\n{'='*60}\n\n", "INFO")
+                
+                # Show full JSON
+                content_text.insert(tk.END, pretty)
+                content_text.config(state=tk.DISABLED)
+                
+                selected_email_var.set(email_id)
+                log_message(f"✓ Viewed email: {subject}", "INFO")
+                
             except Exception as e:
-                log_message(f"Lỗi lấy message {mid}: {e}", "ERROR")
-
-        # Log user/pass for convenience
-        log_message(f"User/Pass: {email} / {password}", "INFO")
+                messagebox.showerror("Error", f"Could not fetch email: {str(e)[:100]}")
+        
+        # Populate email list
+        for idx, msg in enumerate(msgs, 1):
+            mid = msg.get("id")
+            subject = msg.get("subject") or msg.get("from") or "(no subject)"
+            
+            if not mid:
+                continue
+            
+            # Create clickable button for each email
+            def create_button_handler(eid, subj):
+                def on_click():
+                    show_email_content(eid, subj)
+                return on_click
+            
+            btn_frame = tk.Frame(list_scrollable_frame, bg=THEMES[current_theme]["secondary"], relief=tk.RAISED, bd=1)
+            btn_frame.pack(fill=tk.X, pady=3, padx=5)
+            
+            # Number
+            num_label = tk.Label(btn_frame, text=f"#{idx}", font=("Segoe UI", 9, "bold"),
+                                bg=THEMES[current_theme]["secondary"], fg=THEMES[current_theme]["accent"], padx=10, pady=5)
+            num_label.pack(anchor=tk.W)
+            
+            # Subject (clickable)
+            subject_btn = tk.Button(btn_frame, text=subject[:45], font=("Segoe UI", 9),
+                                   bg=THEMES[current_theme]["secondary"], fg=THEMES[current_theme]["warning"], anchor=tk.W, justify=tk.LEFT,
+                                   relief=tk.FLAT, bd=0, padx=10, pady=5,
+                                   command=create_button_handler(mid, subject),
+                                   activebackground=THEMES[current_theme]["primary"], activeforeground=THEMES[current_theme]["accent"],
+                                   wraplength=250)
+            subject_btn.pack(fill=tk.X, padx=10, pady=3)
+        
+        list_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        list_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Show first email by default
+        if msgs and msgs[0].get("id"):
+            first_subject = msgs[0].get("subject") or msgs[0].get("from") or "(no subject)"
+            show_email_content(msgs[0].get("id"), first_subject)
+        
+        # ==================== BUTTONS ====================
+        button_frame = tk.Frame(main_container, bg=THEMES[current_theme]["bg"])
+        button_frame.pack(fill=tk.X, pady=(15, 0))
+        
+        def save_selected_otp():
+            """Save OTP from selected email."""
+            email_id = selected_email_var.get()
+            if not email_id:
+                messagebox.showwarning("Warning", "Select an email first!")
+                return
+            
+            try:
+                r = SESSION.get(f"{API_MAIL}/messages/{email_id}", 
+                              headers={"Authorization": f"Bearer {token}"})
+                r.raise_for_status()
+                data = r.json()
+                
+                import json
+                content = json.dumps(data, ensure_ascii=False)
+                otp = extract_otp(content)
+                
+                if otp:
+                    save_otp_to_csv(email, password, otp)
+                    messagebox.showinfo("Success", f"OTP saved: {otp}")
+                    log_message(f"✓ OTP saved: {otp}", "SUCCESS")
+                else:
+                    messagebox.showwarning("Warning", "No OTP found in this email!")
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not extract OTP: {str(e)[:100]}")
+        
+        # Save OTP button
+        save_btn = tk.Button(button_frame, text="💾 SAVE OTP", font=("Segoe UI", 10, "bold"),
+                            bg=THEMES[current_theme]["success"], fg=THEMES[current_theme]["bg"], padx=20, pady=12, relief=tk.FLAT, bd=0,
+                            command=save_selected_otp, activebackground="#229954" if current_theme == "dark" else "#1e8449", activeforeground=THEMES[current_theme]["bg"],
+                            cursor="hand2", highlightthickness=0)
+        save_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Close button
+        close_btn = tk.Button(button_frame, text="❌ CLOSE", font=("Segoe UI", 10, "bold"),
+                             bg=THEMES[current_theme]["error"], fg=THEMES[current_theme]["bg"], padx=20, pady=12, relief=tk.FLAT, bd=0,
+                             command=viewer_window.destroy, activebackground="#c0392b" if current_theme == "dark" else "#a93226", activeforeground=THEMES[current_theme]["bg"],
+                             cursor="hand2", highlightthickness=0)
+        close_btn.pack(side=tk.LEFT, padx=5)
+        
+        log_message(f"✓ Email viewer opened for {email}", "SUCCESS")
+        
     except Exception as e:
-        log_message(f"Verbose check error: {e}", "ERROR")
+        log_message(f"❌ Verbose check error: {e}", "ERROR")
+        if status_widget:
+            status_widget.set(f"❌ Error: {str(e)[:40]}")
+        else:
+            messagebox.showerror("Error", f"Error: {str(e)[:150]}")
 
 
 def verbose_check_email_dialog():
-    """Prompt user for email and password then run verbose check in background."""
-    email = simpledialog.askstring("Email (mail.tm)", "Nhập địa chỉ email mail.tm:")
-    if not email:
-        log_message("Không có email nhập", "WARNING")
-        return
-    password = simpledialog.askstring("Password", "Nhập password của email:", show='*')
-    if not password:
-        log_message("Không có password nhập", "WARNING")
-        return
-
-    # run in background thread to avoid blocking GUI
-    t = threading.Thread(target=verbose_check_email, args=(email, password), daemon=True)
-    t.start()
+    """Professional form to login with specific email and read inbox."""
+    # Load emails from email_accounts.csv
+    email_list = []
+    try:
+        if os.path.isfile("email_accounts.csv"):
+            with open("email_accounts.csv", mode="r", newline='', encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                if reader:
+                    for row in reader:
+                        email_addr = row.get("email", "").strip()
+                        password = row.get("password", "").strip()
+                        if email_addr and password:
+                            email_list.append({"email": email_addr, "password": password})
+        log_message(f"✓ Loaded {len(email_list)} emails from email_accounts.csv", "INFO")
+    except Exception as e:
+        log_message(f"⚠️ Error loading emails: {e}", "WARNING")
+    
+    # Create form window
+    form_window = tk.Toplevel()
+    form_window.title("📧 LOGIN & CHECK MAIL")
+    form_window.geometry("1200x600")
+    form_window.configure(bg=THEMES[current_theme]["bg"])
+    try:
+        form_window.transient()
+        form_window.grab_set()
+    except:
+        pass
+    
+    # ==================== MAIN CONTAINER ====================
+    main_container = tk.Frame(form_window, bg=THEMES[current_theme]["bg"])
+    main_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=15)
+    
+    # ==================== HEADER ====================
+    header_frame = tk.Frame(main_container, bg=THEMES[current_theme]["primary"], relief=tk.RAISED, bd=1)
+    header_frame.pack(fill=tk.X, pady=(0, 15))
+    
+    title = tk.Label(header_frame, text="📧 LOGIN & CHECK MAIL", font=("Segoe UI", 16, "bold"), 
+                     bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"], padx=20, pady=15)
+    title.pack(anchor=tk.W)
+    
+    subtitle = tk.Label(header_frame, text=f"Select email to login and read inbox ({len(email_list)} emails loaded)", 
+                        font=("Segoe UI", 10), bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["info"], padx=20, pady=5)
+    subtitle.pack(anchor=tk.W)
+    
+    # ==================== CONTENT - THREE SECTIONS ====================
+    content_frame = tk.Frame(main_container, bg=THEMES[current_theme]["bg"])
+    content_frame.pack(fill=tk.BOTH, expand=True)
+    
+    # LEFT COLUMN - Email List
+    left_frame = tk.Frame(content_frame, bg=THEMES[current_theme]["bg"], width=300)
+    left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 10), anchor=tk.NW)
+    left_frame.pack_propagate(False)
+    
+    email_list_label = tk.Label(left_frame, text="📧 Email List", font=("Segoe UI", 11, "bold"),
+                                bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"])
+    email_list_label.pack(anchor=tk.W, pady=5)
+    
+    email_list_frame = tk.Frame(left_frame, bg=THEMES[current_theme]["primary"], relief=tk.SUNKEN, bd=2)
+    email_list_frame.pack(fill=tk.BOTH, expand=True)
+    
+    email_canvas = tk.Canvas(email_list_frame, bg=THEMES[current_theme]["bg"], highlightthickness=0, width=280)
+    email_scrollbar = ttk.Scrollbar(email_list_frame, orient=tk.VERTICAL, command=email_canvas.yview)
+    email_scrollable_frame = tk.Frame(email_canvas, bg=THEMES[current_theme]["bg"])
+    
+    email_scrollable_frame.bind(
+        "<Configure>",
+        lambda e: email_canvas.configure(scrollregion=email_canvas.bbox("all"))
+    )
+    
+    email_canvas.create_window((0, 0), window=email_scrollable_frame, anchor="nw")
+    email_canvas.configure(yscrollcommand=email_scrollbar.set)
+    
+    selected_email_var = tk.StringVar()
+    selected_pwd_var = tk.StringVar()
+    button_dict = {}
+    
+    # Populate email list
+    if email_list:
+        for idx, email_item in enumerate(email_list, 1):
+            email_addr = email_item.get('email', 'N/A')
+            email_pwd = email_item.get('password', 'N/A')
+            
+            def create_email_selector(addr, pwd, btn_list):
+                def on_select():
+                    selected_email_var.set(addr)
+                    selected_pwd_var.set(pwd)
+                    email_display_var.set(addr)
+                    password_display_var.set(pwd)
+                    for btn in btn_list.values():
+                        btn.config(bg=THEMES[current_theme]["secondary"], fg=THEMES[current_theme]["warning"])
+                    btn_list[addr].config(bg=THEMES[current_theme]["accent"], fg=THEMES[current_theme]["primary"])
+                return on_select
+            
+            item_btn = tk.Button(email_scrollable_frame, text=f"#{idx} {email_addr}", 
+                                font=("Courier New", 8),
+                                bg=THEMES[current_theme]["secondary"], fg=THEMES[current_theme]["warning"], anchor=tk.W, justify=tk.LEFT,
+                                relief=tk.FLAT, bd=0, padx=5, pady=6,
+                                command=create_email_selector(email_addr, email_pwd, button_dict),
+                                activebackground=THEMES[current_theme]["accent"], activeforeground=THEMES[current_theme]["primary"], wraplength=250)
+            item_btn.pack(fill=tk.X, pady=2, padx=3)
+            button_dict[email_addr] = item_btn
+    else:
+        no_label = tk.Label(email_scrollable_frame, text="No emails found",
+                           font=("Segoe UI", 10), bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["info"], pady=20)
+        no_label.pack(expand=True)
+    
+    email_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    email_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    # MIDDLE COLUMN - Login Details
+    middle_frame = tk.Frame(content_frame, bg=THEMES[current_theme]["bg"], width=280)
+    middle_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=10, anchor=tk.NW)
+    middle_frame.pack_propagate(False)
+    
+    login_label = tk.Label(middle_frame, text="🔐 LOGIN DETAILS", font=("Segoe UI", 11, "bold"),
+                          bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"])
+    login_label.pack(anchor=tk.W, pady=5)
+    
+    login_box = tk.LabelFrame(middle_frame, text="Login Info", font=("Segoe UI", 10, "bold"),
+                             bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"], padx=12, pady=12, relief=tk.RAISED, bd=1)
+    login_box.pack(fill=tk.BOTH, expand=False)
+    
+    tk.Label(login_box, text="📧 Email:", font=("Segoe UI", 9, "bold"), 
+             bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["fg"]).pack(anchor=tk.W, pady=2)
+    email_display_var = tk.StringVar(value="")
+    tk.Entry(login_box, textvariable=email_display_var, font=("Courier New", 8),
+            bg=THEMES[current_theme]["secondary"], fg=THEMES[current_theme]["warning"], relief=tk.FLAT, bd=1, state=tk.DISABLED).pack(fill=tk.X, pady=3, ipady=5)
+    
+    tk.Label(login_box, text="🔑 Password:", font=("Segoe UI", 9, "bold"), 
+             bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["fg"]).pack(anchor=tk.W, pady=2)
+    password_display_var = tk.StringVar(value="")
+    tk.Entry(login_box, textvariable=password_display_var, font=("Courier New", 8),
+            bg=THEMES[current_theme]["secondary"], fg=THEMES[current_theme]["fg"], relief=tk.FLAT, bd=1, state=tk.DISABLED, show="•").pack(fill=tk.X, pady=3, ipady=5)
+    
+    # Status
+    tk.Label(middle_frame, text="📊 Status", font=("Segoe UI", 11, "bold"),
+            bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"]).pack(anchor=tk.W, pady=(15, 5))
+    
+    status_box = tk.Frame(middle_frame, bg=THEMES[current_theme]["primary"], relief=tk.SUNKEN, bd=1)
+    status_box.pack(fill=tk.BOTH, expand=True)
+    
+    status_var = tk.StringVar(value="Ready to login")
+    status_text = tk.Label(status_box, textvariable=status_var, font=("Segoe UI", 9),
+                          bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"], wraplength=260, justify=tk.LEFT, padx=8, pady=8)
+    status_text.pack(fill=tk.BOTH, expand=True)
+    
+    # RIGHT COLUMN - Email Content Area
+    right_frame = tk.Frame(content_frame, bg=THEMES[current_theme]["bg"])
+    right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+    
+    mail_label = tk.Label(right_frame, text="📬 EMAIL INBOX", font=("Segoe UI", 11, "bold"),
+                         bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"])
+    mail_label.pack(anchor=tk.W, pady=5)
+    
+    mail_frame = tk.Frame(right_frame, bg=THEMES[current_theme]["primary"], relief=tk.SUNKEN, bd=2)
+    mail_frame.pack(fill=tk.BOTH, expand=True)
+    
+    mail_content = scrolledtext.ScrolledText(mail_frame, font=("Courier New", 9), 
+                                            bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"], relief=tk.FLAT, bd=0,
+                                            wrap=tk.WORD, state=tk.DISABLED)
+    mail_content.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+    # ==================== BUTTON SECTION ====================
+    button_frame = tk.Frame(main_container, bg=THEMES[current_theme]["bg"])
+    button_frame.pack(fill=tk.X, pady=(15, 0))
+    
+    def clear_login_fields():
+        """Clear email and password display fields."""
+        email_display_var.set("")
+        password_display_var.set("")
+        selected_email_var.set("")
+        selected_pwd_var.set("")
+        
+        # Show professional empty state in mail content
+        mail_content.config(state=tk.NORMAL)
+        mail_content.delete(1.0, tk.END)
+        
+        # Configure tags for empty state
+        try:
+            mail_content.tag_config("EMPTY_TITLE", foreground=THEMES[current_theme]["accent"], font=("Segoe UI", 12, "bold"))
+            mail_content.tag_config("EMPTY_INFO", foreground=THEMES[current_theme]["info"], font=("Segoe UI", 10))
+            mail_content.tag_config("EMPTY_DESC", foreground=THEMES[current_theme]["info"], font=("Segoe UI", 9))
+        except:
+            pass
+        
+        # Add professional empty state message
+        mail_content.insert(tk.END, "\n" * 8)
+        mail_content.insert(tk.END, "                    📭 NO EMAIL SELECTED\n\n", "EMPTY_TITLE")
+        mail_content.insert(tk.END, "Select an email from the list to view its inbox\n\n", "EMPTY_INFO")
+        mail_content.insert(tk.END, "• Click on any email in the left panel\n", "EMPTY_DESC")
+        mail_content.insert(tk.END, "• Enter your login credentials\n", "EMPTY_DESC")
+        mail_content.insert(tk.END, "• Click '🔓 LOGIN & CHECK' to load emails\n\n", "EMPTY_DESC")
+        
+        mail_content.config(state=tk.DISABLED)
+        status_var.set("Ready to login")
+    
+    def login_and_check():
+        email_val = selected_email_var.get().strip()
+        pwd_val = selected_pwd_var.get().strip()
+        
+        if not email_val or not pwd_val:
+            messagebox.showerror("Error", "Select an email first!", parent=form_window)
+            clear_login_fields()
+            return
+        
+        # Clear mail content trước khi login
+        mail_content.config(state=tk.NORMAL)
+        mail_content.delete(1.0, tk.END)
+        mail_content.insert(tk.END, "⏳ Đang tải email...\n", "INFO")
+        mail_content.config(state=tk.DISABLED)
+        
+        status_var.set("🔄 Logging in...")
+        form_window.update()
+        
+        # Run login in background thread
+        def login_thread():
+            try:
+                # Call verbose_check_email which handles login and displays content
+                verbose_check_email(email_val, pwd_val, mail_content, status_var)
+            except Exception as e:
+                status_var.set(f"❌ Error: {str(e)[:50]}")
+                clear_login_fields()
+                log_message(f"Login error: {e}", "ERROR")
+        
+        t = threading.Thread(target=login_thread, daemon=True)
+        t.start()
+    
+    def close_form():
+        clear_login_fields()
+        form_window.destroy()
+    
+    login_btn = tk.Button(button_frame, text="🔓 LOGIN & CHECK", font=("Segoe UI", 11, "bold"),
+                         bg=THEMES[current_theme]["success"], fg=THEMES[current_theme]["bg"], padx=30, pady=12, relief=tk.FLAT, bd=0,
+                         command=login_and_check, activebackground="#229954" if current_theme == "dark" else "#1e8449", activeforeground=THEMES[current_theme]["bg"],
+                         cursor="hand2", highlightthickness=0)
+    login_btn.pack(side=tk.LEFT, padx=5)
+    
+    close_btn = tk.Button(button_frame, text="❌ CLOSE", font=("Segoe UI", 11, "bold"),
+                         bg=THEMES[current_theme]["error"], fg=THEMES[current_theme]["bg"], padx=30, pady=12, relief=tk.FLAT, bd=0,
+                         command=close_form, activebackground="#c0392b" if current_theme == "dark" else "#a93226", activeforeground=THEMES[current_theme]["bg"],
+                         cursor="hand2", highlightthickness=0)
+    close_btn.pack(side=tk.LEFT, padx=5)
+    
+    # Initialize with cleared fields
+    clear_login_fields()
 
 # ==================== PROXY CHECKER ====================
 API_GEONODE = "https://proxylist.geonode.com/api/proxy-list?limit=200&sort_by=lastChecked&sort_type=desc&protocols=http"
@@ -1107,12 +1654,12 @@ def create_vieon_account(email_data, proxy, proxy_port, sec):
             if not clicked_ok:
                 log_message("⚠️ Không tìm thấy hoặc click nút submit thành công. Tiếp tục polling OTP...", "WARNING")
         
-        # Cho OTP
-        log_message(f"Cho OTP tu Vieon...", "INFO")
+        # Đợi OTP
+        log_message(f"⏳ Đợi OTP từ Vieon...", "INFO")
         otp = wait_for_otp(token, timeout=120)
         
         if not otp:
-            log_message(f"Khong lay duoc OTP", "ERROR")
+            log_message(f"❌ Không lấy được OTP", "ERROR")
             with stats_lock:
                 error_count += 1
             driver.quit()
@@ -1120,17 +1667,31 @@ def create_vieon_account(email_data, proxy, proxy_port, sec):
         
         log_message(f"OTP: {otp}", "SUCCESS")
         
-        # Log HTML form structure for debugging
-        try:
-            html_form = driver.find_element(By.TAG_NAME, "form").get_attribute("outerHTML")
-            log_message(f"=== HTML FORM NHẬP OTP ===", "INFO")
-            log_message(html_form[:1000], "INFO")  # Log first 1000 chars
-            log_message(f"=== HẾT HTML ===", "INFO")
-        except:
-            pass
+        # Track created email
+        created_emails_global.append({"email": email, "password": email_password})
         
-        # Nhap OTP
-        log_message(f"Nhap OTP", "INFO")
+        # Show OTP verbose form - DISABLED (chỉ nhập OTP không cần form)
+        # if show_otp_verbose_form is not None:
+        #     log_message(f"Hiển thị form verbose OTP...", "INFO")
+        #     confirmed, form_email, form_password, form_window = show_otp_verbose_form(
+        #         otp, email, email_password, created_emails_global, theme_config=THEMES, current_theme=current_theme
+        #     )
+        #     
+        #     if not confirmed:
+        #         log_message(f"User hủy trong form verbose", "WARNING")
+        #         with stats_lock:
+        #             error_count += 1
+        #         driver.quit()
+        #         return False
+        #     
+        #     log_message(f"User xác nhận - tiếp tục nhập OTP vào form...", "INFO")
+        # else:
+        #     log_message(f"⚠️ OTP form module not available, using default password", "WARNING")
+        confirmed = True
+        form_password = email_password  # Use original password instead of form input
+        
+        # Nhập OTP
+        log_message(f"ℹ️ Nhập OTP vào form...", "INFO")
         otp_digits = [int(digit) for digit in otp]
         
         for idx, digit in enumerate(otp_digits):
@@ -1140,14 +1701,14 @@ def create_vieon_account(email_data, proxy, proxy_port, sec):
             except:
                 pass
         
-        # Nhap password
-        log_message(f"Nhap password", "INFO")
+        # Nhập mật khẩu
+        log_message(f"ℹ️ Nhập mật khẩu...", "INFO")
         time.sleep(1)
         input_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[id='password']")))
-        input_box.send_keys('201098')
+        input_box.send_keys(form_password)
         
         input_box = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[id='confirmPassword']")))
-        input_box.send_keys('201098')
+        input_box.send_keys(form_password)
         
         # Click checkbox
         checkbox = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "span[class='Style_checkMark__CzYF7']")))
@@ -1482,7 +2043,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.title("🚀 Vieon Account Creator v2")
     root.geometry("1100x850")
-    root.configure(bg=THEMES["dark"]["bg"])
+    root.configure(bg=THEMES[current_theme]["bg"])
     root.resizable(True, True)
     
     # Ensure window is properly initialized
@@ -1512,9 +2073,10 @@ if __name__ == "__main__":
         
         # Update headers
         header_frame.configure(bg=theme["primary"])
+        header_inner.configure(bg=theme["primary"])
         header.configure(bg=theme["primary"], fg=theme["accent"])
         theme_btn.configure(bg=theme["accent"], fg=theme["primary"], 
-                           activebackground=theme["secondary"], activeforeground=theme["accent"])
+                           activebackground=theme["secondary"], activeforeground=theme["primary"])
         
         # Update control frames
         control_frame.configure(bg=theme["primary"])
@@ -1523,15 +2085,26 @@ if __name__ == "__main__":
         button_frame.configure(bg=theme["bg"])
         stats_frame.configure(bg=theme["primary"])
         log_frame.configure(bg=theme["bg"])
+        internet_frame.configure(bg=theme["primary"])
         
-        # Update labels
+        # Update all labels
         proxy_label.configure(bg=theme["primary"], fg=theme["accent"])
         sec_label.configure(bg=theme["primary"], fg=theme["accent"])
         port_label.configure(bg=theme["primary"], fg=theme["accent"])
         threads_label.configure(bg=theme["primary"], fg=theme["accent"])
+        proxy_hint.configure(bg=theme["primary"], fg=theme["info"])
+        threads_hint.configure(bg=theme["primary"], fg=theme["info"])
+        log_label.configure(bg=theme["bg"], fg=theme["accent"])
+        stats_label.configure(bg=theme["primary"], fg=theme["accent"])
         
         for label in theme_elements["labels"]:
             label.configure(bg=theme["primary"], fg=theme["accent"])
+        
+        # Update checkbutton (internet search)
+        internet_search_check.configure(bg=theme["primary"], fg=theme["accent"],
+                                       activebackground=theme["secondary"],
+                                       activeforeground=theme["accent"],
+                                       selectcolor=theme["secondary"])
         
         # Update entries
         proxy_entry.configure(bg=theme["secondary"], fg=theme["fg"], insertbackground=theme["accent"])
@@ -1540,10 +2113,14 @@ if __name__ == "__main__":
         threads_entry.configure(bg=theme["secondary"], fg=theme["fg"], insertbackground=theme["accent"])
         
         # Update buttons
-        start_btn.configure(bg=theme["success"], fg=theme["primary"],
-                           activebackground=theme["secondary"], activeforeground=theme["accent"])
-        stop_btn.configure(bg=theme["error"], fg=theme["primary"],
-                          activebackground=theme["secondary"], activeforeground=theme["accent"])
+        start_btn.configure(bg=theme["success"], fg=theme["bg"],
+                           activebackground=theme["secondary"], activeforeground=theme["bg"])
+        stop_btn.configure(bg=theme["error"], fg=theme["bg"],
+                          activebackground=theme["secondary"], activeforeground=theme["bg"])
+        check_proxy_btn.configure(bg=theme["warning"], fg=theme["bg"],
+                                 activebackground=theme["secondary"], activeforeground=theme["bg"])
+        verbose_btn.configure(bg=theme["info"], fg=theme["bg"],
+                             activebackground=theme["secondary"], activeforeground=theme["bg"])
         
         # Update log output
         if current_theme == "light":
@@ -1552,62 +2129,62 @@ if __name__ == "__main__":
             log_output.tag_config("SUCCESS", foreground=theme["success"])
             log_output.tag_config("WARNING", foreground=theme["warning"])
             log_output.tag_config("ERROR", foreground=theme["error"])
+            log_output.tag_config("EMPTY_TITLE", foreground=theme["warning"])
         else:
             log_output.configure(bg=theme["bg"], fg=theme["info"], insertbackground=theme["info"])
             log_output.tag_config("INFO", foreground=theme["info"])
             log_output.tag_config("SUCCESS", foreground=theme["success"])
             log_output.tag_config("WARNING", foreground=theme["warning"])
             log_output.tag_config("ERROR", foreground=theme["error"])
-        
-        stats_label.configure(bg=theme["primary"], fg=theme["accent"])
+            log_output.tag_config("EMPTY_TITLE", foreground=theme["accent"])
     
     # ========== HEADER ==========
-    header_frame = tk.Frame(root, bg=THEMES["dark"]["primary"], relief=tk.RAISED, bd=2)
+    header_frame = tk.Frame(root, bg=THEMES[current_theme]["primary"], relief=tk.RAISED, bd=2)
     header_frame.pack(fill=tk.X)
     
-    header_inner = tk.Frame(header_frame, bg=THEMES["dark"]["primary"])
+    header_inner = tk.Frame(header_frame, bg=THEMES[current_theme]["primary"])
     header_inner.pack(fill=tk.X, padx=10, pady=10)
     
     header = tk.Label(header_inner, text="🚀 VIEON ACCOUNT CREATOR", font=("Arial", 22, "bold"), 
-                     bg=THEMES["dark"]["primary"], fg=THEMES["dark"]["accent"])
+                     bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"])
     header.pack(side=tk.LEFT, expand=True)
     
     theme_btn = tk.Button(header_inner, text="🌙 Theme", font=("Arial", 10, "bold"),
-                         bg=THEMES["dark"]["accent"], fg=THEMES["dark"]["primary"],
-                         command=toggle_theme, padx=10, pady=5, relief=tk.RAISED, bd=2)
+                         bg=THEMES[current_theme]["accent"], fg=THEMES[current_theme]["primary"],
+                         command=toggle_theme, padx=10, pady=5, relief=tk.FLAT, bd=0, cursor="hand2", highlightthickness=0)
     theme_btn.pack(side=tk.RIGHT, padx=5)
     
     # ========== CONTROL FRAME ==========
-    control_frame = tk.Frame(root, bg=THEMES["dark"]["primary"], relief=tk.SUNKEN, bd=1)
+    control_frame = tk.Frame(root, bg=THEMES[current_theme]["primary"], relief=tk.SUNKEN, bd=1)
     control_frame.pack(pady=10, padx=10, fill=tk.X)
     
     # Proxy Input
-    proxy_frame = tk.Frame(control_frame, bg=THEMES["dark"]["primary"])
+    proxy_frame = tk.Frame(control_frame, bg=THEMES[current_theme]["primary"])
     proxy_frame.pack(pady=8, padx=15, fill=tk.X)
     
     proxy_label = tk.Label(proxy_frame, text="Proxy:", font=("Arial", 11, "bold"), 
-                          bg=THEMES["dark"]["primary"], fg=THEMES["dark"]["accent"])
+                          bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"])
     proxy_label.pack(side=tk.LEFT, padx=5)
     
-    proxy_entry = tk.Entry(proxy_frame, font=("Arial", 11), width=25, bg=THEMES["dark"]["secondary"], 
-                          fg=THEMES["dark"]["fg"], insertbackground=THEMES["dark"]["accent"])
+    proxy_entry = tk.Entry(proxy_frame, font=("Arial", 11), width=25, bg=THEMES[current_theme]["secondary"], 
+                          fg=THEMES[current_theme]["fg"], insertbackground=THEMES[current_theme]["accent"])
     proxy_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
     
     port_label = tk.Label(proxy_frame, text="Port:", font=("Arial", 11, "bold"), 
-                         bg=THEMES["dark"]["primary"], fg=THEMES["dark"]["accent"])
+                         bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"])
     port_label.pack(side=tk.LEFT, padx=(20, 5))
     
-    port_entry = tk.Entry(proxy_frame, font=("Arial", 11), width=8, bg=THEMES["dark"]["secondary"], 
-                         fg=THEMES["dark"]["fg"], insertbackground=THEMES["dark"]["accent"])
+    port_entry = tk.Entry(proxy_frame, font=("Arial", 11), width=8, bg=THEMES[current_theme]["secondary"], 
+                         fg=THEMES[current_theme]["fg"], insertbackground=THEMES[current_theme]["accent"])
     port_entry.insert(0, "3128")
     port_entry.pack(side=tk.LEFT, padx=5)
     
     proxy_hint = tk.Label(proxy_frame, text="(để trống = không dùng)", font=("Arial", 9), 
-                         bg=THEMES["dark"]["primary"], fg="#888888")
+                         bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["info"])
     proxy_hint.pack(side=tk.LEFT, padx=5)
     
     # Internet Search Option
-    internet_frame = tk.Frame(control_frame, bg=THEMES["dark"]["primary"])
+    internet_frame = tk.Frame(control_frame, bg=THEMES[current_theme]["primary"])
     internet_frame.pack(pady=8, padx=15, fill=tk.X)
     
     internet_search_var = tk.BooleanVar(value=False)
@@ -1615,10 +2192,10 @@ if __name__ == "__main__":
         internet_frame, text="Search proxy on Internet",
         variable=internet_search_var,
         font=("Arial", 11, "bold"),
-        bg=THEMES["dark"]["primary"], fg=THEMES["dark"]["accent"],
-        activebackground=THEMES["dark"]["secondary"],
-        activeforeground=THEMES["dark"]["accent"],
-        selectcolor=THEMES["dark"]["secondary"],
+        bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"],
+        activebackground=THEMES[current_theme]["secondary"],
+        activeforeground=THEMES[current_theme]["accent"],
+        selectcolor=THEMES[current_theme]["secondary"],
         command=lambda: toggle_internet_proxy()
     )
     internet_search_check.pack(side=tk.LEFT, padx=5)
@@ -1639,95 +2216,101 @@ if __name__ == "__main__":
         pass  # Hàm này đã được thay thế bởi toggle_internet_proxy()
     
     # Delay & Threads
-    params_frame = tk.Frame(control_frame, bg=THEMES["dark"]["primary"])
+    params_frame = tk.Frame(control_frame, bg=THEMES[current_theme]["primary"])
     params_frame.pack(pady=8, padx=15, fill=tk.X)
     
     sec_label = tk.Label(params_frame, text="Delay (s):", font=("Arial", 11, "bold"), 
-                        bg=THEMES["dark"]["primary"], fg=THEMES["dark"]["accent"])
+                        bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"])
     sec_label.pack(side=tk.LEFT, padx=5)
     
-    sec_entry = tk.Entry(params_frame, font=("Arial", 11), width=8, bg=THEMES["dark"]["secondary"], 
-                        fg=THEMES["dark"]["fg"], insertbackground=THEMES["dark"]["accent"])
+    sec_entry = tk.Entry(params_frame, font=("Arial", 11), width=8, bg=THEMES[current_theme]["secondary"], 
+                        fg=THEMES[current_theme]["fg"], insertbackground=THEMES[current_theme]["accent"])
     sec_entry.insert(0, "15")
     sec_entry.pack(side=tk.LEFT, padx=5)
     
     threads_label = tk.Label(params_frame, text="Luồng:", font=("Arial", 11, "bold"), 
-                            bg=THEMES["dark"]["primary"], fg=THEMES["dark"]["accent"])
+                            bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"])
     threads_label.pack(side=tk.LEFT, padx=20)
     
-    threads_entry = tk.Entry(params_frame, font=("Arial", 11), width=8, bg=THEMES["dark"]["secondary"], 
-                            fg=THEMES["dark"]["fg"], insertbackground=THEMES["dark"]["accent"])
+    threads_entry = tk.Entry(params_frame, font=("Arial", 11), width=8, bg=THEMES[current_theme]["secondary"], 
+                            fg=THEMES[current_theme]["fg"], insertbackground=THEMES[current_theme]["accent"])
     threads_entry.insert(0, "1")
     threads_entry.pack(side=tk.LEFT, padx=5)
     
     threads_hint = tk.Label(params_frame, text="(mac dinh: 1)", font=("Arial", 9), 
-                           bg=THEMES["dark"]["primary"], fg="#888888")
+                           bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["info"])
     threads_hint.pack(side=tk.LEFT, padx=5)
     
     # ========== BUTTONS ==========
-    button_frame = tk.Frame(root, bg=THEMES["dark"]["bg"])
+    button_frame = tk.Frame(root, bg=THEMES[current_theme]["bg"])
     button_frame.pack(pady=12)
     
     start_btn = tk.Button(
-        button_frame, text="BẮT ĐẦU",
+        button_frame, text="▶ BẮT ĐẦU",
         font=("Arial", 12, "bold"),
-        bg=THEMES["dark"]["success"], fg=THEMES["dark"]["primary"],
-        activebackground=THEMES["dark"]["secondary"],
-        padx=20, pady=10,
+        bg=THEMES[current_theme]["success"], fg=THEMES[current_theme]["bg"],
+        activebackground="#229954" if current_theme == "dark" else "#1e8449", activeforeground=THEMES[current_theme]["bg"],
+        padx=25, pady=12,
         command=lambda: start_bot(start_btn, stop_btn, proxy_entry, port_entry, sec_entry, threads_entry,
                                  internet_search_var),
-        width=16,
-        relief=tk.RAISED,
-        bd=2
+        relief=tk.FLAT,
+        bd=0,
+        cursor="hand2",
+        highlightthickness=0
     )
     start_btn.pack(side=tk.LEFT, padx=8)
     
     stop_btn = tk.Button(
-        button_frame, text="DỪNG",
+        button_frame, text="⏹ DỪNG",
         font=("Arial", 12, "bold"),
-        bg=THEMES["dark"]["error"], fg=THEMES["dark"]["primary"],
-        activebackground=THEMES["dark"]["secondary"],
-        padx=20, pady=10,
+        bg=THEMES[current_theme]["error"], fg=THEMES[current_theme]["bg"],
+        activebackground="#c0392b" if current_theme == "dark" else "#a93226", activeforeground=THEMES[current_theme]["bg"],
+        padx=25, pady=12,
         command=lambda: stop_bot_func(start_btn, stop_btn, proxy_entry, port_entry, sec_entry, threads_entry,
                                      internet_search_var),
-        width=16,
         state="disabled",
-        relief=tk.RAISED,
-        bd=2
+        relief=tk.FLAT,
+        bd=0,
+        cursor="hand2",
+        highlightthickness=0
     )
     stop_btn.pack(side=tk.LEFT, padx=8)
     
     check_proxy_btn = tk.Button(
-        button_frame, text="CHECK PROXY",
+        button_frame, text="🔍 CHECK PROXY",
         font=("Arial", 12, "bold"),
-        bg=THEMES["dark"]["warning"], fg=THEMES["dark"]["primary"],
-        activebackground=THEMES["dark"]["secondary"],
-        padx=15, pady=10,
+        bg=THEMES[current_theme]["warning"], fg=THEMES[current_theme]["bg"],
+        activebackground="#d68910" if current_theme == "dark" else "#ba4a00", activeforeground=THEMES[current_theme]["bg"],
+        padx=20, pady=12,
         command=lambda: threading.Thread(target=test_all_proxies, args=(proxy_entry, port_entry, internet_search_var), daemon=True).start(),
-        relief=tk.RAISED,
-        bd=2
+        relief=tk.FLAT,
+        bd=0,
+        cursor="hand2",
+        highlightthickness=0
     )
     check_proxy_btn.pack(side=tk.LEFT, padx=8)
     
     verbose_btn = tk.Button(
-        button_frame, text="VERBOSE OTP",
-        font=("Arial", 12, "bold"),
-        bg=THEMES["dark"]["secondary"], fg=THEMES["dark"]["primary"],
-        activebackground=THEMES["dark"]["secondary"],
-        padx=15, pady=10,
+        button_frame, text="📧 VERBOSE OTP",
+        font=("Segoe UI", 11, "bold"),
+        bg=THEMES[current_theme]["info"], fg=THEMES[current_theme]["bg"],
+        activebackground="#2980b9" if current_theme == "dark" else "#2471a3", activeforeground=THEMES[current_theme]["bg"],
+        padx=20, pady=12,
         command=lambda: verbose_check_email_dialog(),
-        relief=tk.RAISED,
-        bd=2
+        relief=tk.FLAT,
+        bd=0,
+        cursor="hand2",
+        highlightthickness=0
     )
     verbose_btn.pack(side=tk.LEFT, padx=8)
     
     # ========== STATS FRAME ==========
-    stats_frame = tk.Frame(root, bg=THEMES["dark"]["primary"], relief=tk.SUNKEN, bd=1)
+    stats_frame = tk.Frame(root, bg=THEMES[current_theme]["primary"], relief=tk.SUNKEN, bd=1)
     stats_frame.pack(pady=8, padx=10, fill=tk.X)
     
     stats_label = tk.Label(stats_frame, 
                           text="Thành công: 0  |  Lỗi: 0  |  Thời gian: 00:00:00",
-                          font=("Arial", 11, "bold"), bg=THEMES["dark"]["primary"], fg=THEMES["dark"]["accent"])
+                          font=("Arial", 11, "bold"), bg=THEMES[current_theme]["primary"], fg=THEMES[current_theme]["accent"])
     stats_label.pack(pady=8)
     
     # ========== PROGRESS BAR ==========
@@ -1738,10 +2321,10 @@ if __name__ == "__main__":
     
     # ========== OUTPUT LOG ==========
     log_label = tk.Label(root, text="📋 OUTPUT LOG", font=("Arial", 12, "bold"), 
-                        bg=THEMES["dark"]["bg"], fg=THEMES["dark"]["accent"])
+                        bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["accent"])
     log_label.pack(pady=(10, 5), padx=10, anchor="w")
     
-    log_frame = tk.Frame(root, bg=THEMES["dark"]["bg"], relief=tk.SUNKEN, bd=2)
+    log_frame = tk.Frame(root, bg=THEMES[current_theme]["bg"], relief=tk.SUNKEN, bd=2)
     log_frame.pack(pady=5, padx=10, fill=tk.BOTH, expand=True)
     
     # Assign to global variable (declared at top of file)
@@ -1749,8 +2332,8 @@ if __name__ == "__main__":
     this_module = sys.modules[__name__]
     this_module.log_output = scrolledtext.ScrolledText(
         log_frame, font=("Courier", 9), 
-        bg=THEMES["dark"]["bg"], fg=THEMES["dark"]["info"],
-        insertbackground=THEMES["dark"]["info"],
+        bg=THEMES[current_theme]["bg"], fg=THEMES[current_theme]["info"],
+        insertbackground=THEMES[current_theme]["info"],
         state=tk.DISABLED,
         wrap=tk.WORD
     )
@@ -1760,10 +2343,10 @@ if __name__ == "__main__":
     process_log_queue()
     
     # Configure text tags for colors
-    log_output.tag_config("INFO", foreground=THEMES["dark"]["info"])
-    log_output.tag_config("SUCCESS", foreground=THEMES["dark"]["success"])
-    log_output.tag_config("WARNING", foreground=THEMES["dark"]["warning"])
-    log_output.tag_config("ERROR", foreground=THEMES["dark"]["error"])
+    log_output.tag_config("INFO", foreground=THEMES[current_theme]["info"])
+    log_output.tag_config("SUCCESS", foreground=THEMES[current_theme]["success"])
+    log_output.tag_config("WARNING", foreground=THEMES[current_theme]["warning"])
+    log_output.tag_config("ERROR", foreground=THEMES[current_theme]["error"])
     
     # ========== STATS UPDATE LOOP ==========
     def update_stats_loop():
